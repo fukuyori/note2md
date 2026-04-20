@@ -393,6 +393,31 @@ func makeUniqueOutputPath(stem string, extension string) string {
 	}
 }
 
+func makeUniqueFilePath(directory string, fileName string) string {
+	if fileName == "" {
+		fileName = "file"
+	}
+
+	candidate := filepath.Join(directory, fileName)
+	if !pathExists(candidate) {
+		return candidate
+	}
+
+	extension := filepath.Ext(fileName)
+	stem := strings.TrimSuffix(fileName, extension)
+	if stem == "" {
+		stem = "file"
+	}
+
+	for index := 2; ; index++ {
+		suffix := fmt.Sprintf("-%d", index)
+		candidate = filepath.Join(directory, stem+suffix+extension)
+		if !pathExists(candidate) {
+			return candidate
+		}
+	}
+}
+
 func trimFileStemToLength(stem string, limit int) string {
 	if limit <= 0 {
 		return "note"
@@ -626,7 +651,7 @@ func downloadImage(resolvedURL *url.URL, client *http.Client, outputPath string,
 	}
 
 	fileName := deriveImageFileName(resolvedURL, response.Header.Get("Content-Type"))
-	targetPath := filepath.Join(imageDir, fileName)
+	targetPath := makeUniqueFilePath(imageDir, fileName)
 
 	file, err := os.Create(targetPath)
 	if err != nil {
