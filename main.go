@@ -34,6 +34,7 @@ type convertedNote struct {
 }
 
 const maxFileStemRunes = 80
+const version = "0.9.2"
 
 var invalidFileNameRuneMap = map[rune]rune{
 	'<':  '＜',
@@ -58,10 +59,14 @@ func run(args []string) error {
 	opts, err := parseArgs(args)
 	if err != nil {
 		if errors.Is(err, errShowUsage) {
-			printUsage()
+			printUsage(os.Stdout)
 			return nil
 		}
-		printUsage()
+		if errors.Is(err, errShowVersion) {
+			printVersion(os.Stdout)
+			return nil
+		}
+		printUsage(os.Stderr)
 		return err
 	}
 
@@ -73,6 +78,7 @@ func run(args []string) error {
 }
 
 var errShowUsage = errors.New("show usage")
+var errShowVersion = errors.New("show version")
 
 func parseArgs(args []string) (cliOptions, error) {
 	opts := cliOptions{
@@ -86,6 +92,8 @@ func parseArgs(args []string) (cliOptions, error) {
 		switch arg {
 		case "-h", "--help":
 			return cliOptions{}, errShowUsage
+		case "-v", "--version":
+			return cliOptions{}, errShowVersion
 		case "-o", "--output":
 			index++
 			if index >= len(args) {
@@ -142,9 +150,22 @@ func parseArgs(args []string) (cliOptions, error) {
 	return opts, nil
 }
 
-func printUsage() {
-	fmt.Fprintln(os.Stderr, "Usage: note2md [--timeout 30] [--images-dir images] [--no-images] [-o output.md] <note-url>")
-	fmt.Fprintln(os.Stderr, "   or: note2md [--timeout 30] [--images-dir images] [--no-images] --input-file urls.txt")
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: note2md [--timeout 30] [--images-dir images] [--no-images] [-o output.md] <note-url>")
+	fmt.Fprintln(w, "   or: note2md [--timeout 30] [--images-dir images] [--no-images] --input-file urls.txt")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Options:")
+	fmt.Fprintln(w, "  -h, --help        Show this help message")
+	fmt.Fprintln(w, "  -v, --version     Show version")
+	fmt.Fprintln(w, "  -o, --output      Write Markdown to a file, or '-' for stdout")
+	fmt.Fprintln(w, "  -f, --input-file  Read note URLs from a file")
+	fmt.Fprintln(w, "      --images-dir  Directory for downloaded images (default: images)")
+	fmt.Fprintln(w, "      --no-images   Keep original image URLs instead of downloading")
+	fmt.Fprintln(w, "      --timeout     Timeout in seconds (default: 30)")
+}
+
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "note2md %s\n", version)
 }
 
 func runSingle(opts cliOptions) error {

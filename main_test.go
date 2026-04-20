@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -73,5 +75,43 @@ func TestMakeUniqueFilePathAddsSuffixOnCollision(t *testing.T) {
 	want := filepath.Join(tempDir, "image-2.png")
 	if got != want {
 		t.Fatalf("makeUniqueFilePath returned %q, want %q", got, want)
+	}
+}
+
+func TestParseArgsVersion(t *testing.T) {
+	t.Parallel()
+
+	for _, arg := range []string{"--version", "-v"} {
+		_, err := parseArgs([]string{arg})
+		if err != errShowVersion {
+			t.Fatalf("parseArgs(%s) error = %v, want %v", arg, err, errShowVersion)
+		}
+	}
+}
+
+func TestPrintUsageIncludesHelpAndVersion(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	printUsage(&buf)
+	got := buf.String()
+
+	for _, want := range []string{"-h, --help", "-v, --version", "Usage: note2md"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("printUsage() missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestPrintVersion(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	printVersion(&buf)
+
+	got := buf.String()
+	want := "note2md " + version + "\n"
+	if got != want {
+		t.Fatalf("printVersion() = %q, want %q", got, want)
 	}
 }
