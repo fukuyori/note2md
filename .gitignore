@@ -1,0 +1,21 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Local caches
+.gocache/
+
+# Common output directories
+bin/
+dist/
+
+# IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
