@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 type cliOptions struct {
@@ -33,8 +34,19 @@ type convertedNote struct {
 	Markdown string
 }
 
+type qiitaFrontMatter struct {
+	Title string
+}
+
+type qiitaArticleMeta struct {
+	Title       string
+	UpdatedDate string
+	PostedDate  string
+}
+
 const maxFileStemRunes = 80
-const version = "0.9.2"
+const version = "0.9.3"
+const emptyArticleBodyMessage = "_No article body could be extracted from the page._"
 
 var invalidFileNameRuneMap = map[rune]rune{
 	'<':  '＜',
@@ -136,7 +148,7 @@ func parseArgs(args []string) (cliOptions, error) {
 	}
 
 	if opts.URL != "" && opts.InputFile != "" {
-		return cliOptions{}, fmt.Errorf("use either a note URL or --input-file, not both")
+		return cliOptions{}, fmt.Errorf("use either an article URL or --input-file, not both")
 	}
 
 	if opts.InputFile != "" && opts.Output != "" {
@@ -144,21 +156,21 @@ func parseArgs(args []string) (cliOptions, error) {
 	}
 
 	if opts.URL == "" && opts.InputFile == "" {
-		return cliOptions{}, fmt.Errorf("note article URL is required")
+		return cliOptions{}, fmt.Errorf("article URL is required")
 	}
 
 	return opts, nil
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: note2md [--timeout 30] [--images-dir images] [--no-images] [-o output.md] <note-url>")
+	fmt.Fprintln(w, "Usage: note2md [--timeout 30] [--images-dir images] [--no-images] [-o output.md] <article-url>")
 	fmt.Fprintln(w, "   or: note2md [--timeout 30] [--images-dir images] [--no-images] --input-file urls.txt")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Options:")
 	fmt.Fprintln(w, "  -h, --help        Show this help message")
 	fmt.Fprintln(w, "  -v, --version     Show version")
 	fmt.Fprintln(w, "  -o, --output      Write Markdown to a file, or '-' for stdout")
-	fmt.Fprintln(w, "  -f, --input-file  Read note URLs from a file")
+	fmt.Fprintln(w, "  -f, --input-file  Read article URLs from a file")
 	fmt.Fprintln(w, "      --images-dir  Directory for downloaded images (default: images)")
 	fmt.Fprintln(w, "      --no-images   Keep original image URLs instead of downloading")
 	fmt.Fprintln(w, "      --timeout     Timeout in seconds (default: 30)")
@@ -171,7 +183,7 @@ func printVersion(w io.Writer) {
 func runSingle(opts cliOptions) error {
 	if opts.Output == "-" {
 		opts.NoImages = true
-		note, err := convertNoteURL(opts.URL, opts.Timeout, "", opts.ImagesDir, opts.NoImages)
+		note, err := convertArticleURL(opts.URL, opts.Timeout, "", opts.ImagesDir, opts.NoImages)
 		if err != nil {
 			return err
 		}
@@ -180,7 +192,7 @@ func runSingle(opts cliOptions) error {
 	}
 
 	if opts.Output == "" {
-		note, err := convertNoteURL(opts.URL, opts.Timeout, "", opts.ImagesDir, opts.NoImages)
+		note, err := convertArticleURL(opts.URL, opts.Timeout, "", opts.ImagesDir, opts.NoImages)
 		if err != nil {
 			return err
 		}
@@ -192,7 +204,7 @@ func runSingle(opts cliOptions) error {
 		return nil
 	}
 
-	note, err := convertNoteURL(opts.URL, opts.Timeout, opts.Output, opts.ImagesDir, opts.NoImages)
+	note, err := convertArticleURL(opts.URL, opts.Timeout, opts.Output, opts.ImagesDir, opts.NoImages)
 	if err != nil {
 		return err
 	}
@@ -211,7 +223,7 @@ func runBatch(opts cliOptions) error {
 		return err
 	}
 	if len(urls) == 0 {
-		return fmt.Errorf("no note URLs found in %s", filepath.Clean(opts.InputFile))
+		return fmt.Errorf("no article URLs found in %s", filepath.Clean(opts.InputFile))
 	}
 
 	for _, articleURL := range urls {
@@ -250,29 +262,26 @@ func readURLFile(path string) ([]string, error) {
 	return urls, nil
 }
 
-func convertNoteURL(noteURL string, timeout time.Duration, outputPath string, imagesDir string, noImages bool) (convertedNote, error) {
-	parsedURL, err := url.Parse(noteURL)
+func convertArticleURL(articleURL string, timeout time.Duration, outputPath string, imagesDir string, noImages bool) (convertedNote, error) {
+	parsedURL, err := url.Parse(articleURL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return convertedNote{}, fmt.Errorf("invalid note URL: %q", noteURL)
+		return convertedNote{}, fmt.Errorf("invalid article URL: %q", articleURL)
 	}
 
 	client := &http.Client{Timeout: timeout}
-	response, err := client.Get(parsedURL.String())
+	if isQiitaURL(parsedURL) {
+		return convertQiitaURL(parsedURL, client, outputPath, imagesDir, noImages)
+	}
+
+	return convertHTMLArticleURL(parsedURL, client, outputPath, imagesDir, noImages)
+}
+
+func convertHTMLArticleURL(parsedURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (convertedNote, error) {
+	document, err := fetchText(client, parsedURL)
 	if err != nil {
-		return convertedNote{}, fmt.Errorf("fetch %s: %w", parsedURL.Redacted(), err)
-	}
-	defer response.Body.Close()
-
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return convertedNote{}, fmt.Errorf("fetch %s: unexpected status %s", parsedURL.Redacted(), response.Status)
+		return convertedNote{}, err
 	}
 
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		return convertedNote{}, fmt.Errorf("read %s: %w", parsedURL.Redacted(), err)
-	}
-
-	document := string(body)
 	title := normalizeDocumentTitle(extractTitle(document))
 	content := extractNoteContent(document)
 	if content == "" {
@@ -288,16 +297,40 @@ func convertNoteURL(noteURL string, timeout time.Duration, outputPath string, im
 	markdownBody = trimDuplicateHeading(markdownBody, title)
 	markdownBody = normalizeNoteMarkdown(markdownBody)
 
-	if title == "" {
-		title = deriveSlug(parsedURL)
+	return buildConvertedArticle(parsedURL, title, markdownBody), nil
+}
+
+func convertQiitaURL(articleURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (convertedNote, error) {
+	markdownURL := qiitaMarkdownURL(articleURL)
+	markdownBody, err := fetchText(client, markdownURL)
+	if err != nil {
+		return convertedNote{}, err
 	}
-	if markdownBody == "" {
-		markdownBody = "_No article body could be extracted from the page._"
+
+	frontMatter, body := parseQiitaFrontMatter(markdownBody)
+	markdownBody, err = replaceMarkdownImages(markdownBody, articleURL, client, outputPath, imagesDir, noImages)
+	if err != nil {
+		return convertedNote{}, err
+	}
+	frontMatter, body = parseQiitaFrontMatter(markdownBody)
+
+	meta, _ := fetchQiitaArticleMeta(articleURL, client)
+	title := firstNonEmpty(frontMatter.Title, meta.Title, extractMarkdownTitle(body))
+	markdownBody = normalizeQiitaMarkdown(body, title)
+	return buildQiitaArticle(articleURL, title, meta, markdownBody), nil
+}
+
+func buildConvertedArticle(articleURL *url.URL, title string, markdownBody string) convertedNote {
+	if title == "" {
+		title = deriveSlug(articleURL)
+	}
+	if strings.TrimSpace(markdownBody) == "" {
+		markdownBody = emptyArticleBodyMessage
 	}
 
 	var builder strings.Builder
 	builder.WriteString("Source: ")
-	builder.WriteString(parsedURL.String())
+	builder.WriteString(articleURL.String())
 	builder.WriteString("\n\n")
 	builder.WriteString(markdownBody)
 	if !strings.HasSuffix(markdownBody, "\n") {
@@ -307,7 +340,84 @@ func convertNoteURL(noteURL string, timeout time.Duration, outputPath string, im
 	return convertedNote{
 		Title:    title,
 		Markdown: builder.String(),
+	}
+}
+
+func fetchText(client *http.Client, targetURL *url.URL) (string, error) {
+	response, err := client.Get(targetURL.String())
+	if err != nil {
+		return "", fmt.Errorf("fetch %s: %w", targetURL.Redacted(), err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("fetch %s: unexpected status %s", targetURL.Redacted(), response.Status)
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", targetURL.Redacted(), err)
+	}
+
+	return string(body), nil
+}
+
+func fetchQiitaArticleMeta(articleURL *url.URL, client *http.Client) (qiitaArticleMeta, error) {
+	document, err := fetchText(client, articleURL)
+	if err != nil {
+		return qiitaArticleMeta{}, err
+	}
+
+	return qiitaArticleMeta{
+		Title:       normalizeDocumentTitle(extractTitle(document)),
+		UpdatedDate: extractQiitaDate(document, "Last updated at"),
+		PostedDate:  extractQiitaDate(document, "Posted at"),
 	}, nil
+}
+
+func buildQiitaArticle(articleURL *url.URL, title string, meta qiitaArticleMeta, markdownBody string) convertedNote {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = deriveSlug(articleURL)
+	}
+	if strings.TrimSpace(markdownBody) == "" {
+		markdownBody = emptyArticleBodyMessage
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Source: ")
+	builder.WriteString(articleURL.String())
+	builder.WriteString("\n\n")
+	if title != "" {
+		builder.WriteString("# ")
+		builder.WriteString(title)
+		builder.WriteString("\n\n")
+	}
+	if meta.UpdatedDate != "" {
+		builder.WriteString("Last updated at ")
+		builder.WriteString(meta.UpdatedDate)
+		builder.WriteString("\n")
+	}
+	if meta.PostedDate != "" {
+		builder.WriteString("Posted at ")
+		builder.WriteString(meta.PostedDate)
+		builder.WriteString("\n")
+	}
+	if meta.UpdatedDate != "" || meta.PostedDate != "" {
+		builder.WriteString("\n")
+	}
+	builder.WriteString("---\n")
+	if markdownBody != "" {
+		builder.WriteString(markdownBody)
+		if !strings.HasSuffix(markdownBody, "\n") {
+			builder.WriteString("\n")
+		}
+	}
+
+	return convertedNote{
+		Title:    title,
+		Markdown: builder.String(),
+	}
 }
 
 func defaultOutputPath(noteURL string, title string) string {
@@ -319,14 +429,14 @@ func defaultOutputPath(noteURL string, title string) string {
 	if stem == "" {
 		parsedURL, err := url.Parse(noteURL)
 		if err != nil {
-			stem = "note"
+			stem = "article"
 		} else {
 			stem = deriveSlug(parsedURL)
 		}
 	}
 
 	if stem == "" {
-		stem = "note"
+		stem = "article"
 	}
 
 	stem = trimFileStemToLength(stem, maxFileStemRunes)
@@ -397,7 +507,7 @@ func replaceTrailingInvalidFilenameRunes(value string) string {
 
 func makeUniqueOutputPath(stem string, extension string) string {
 	if stem == "" {
-		stem = "note"
+		stem = "article"
 	}
 
 	candidate := stem + extension
@@ -441,7 +551,7 @@ func makeUniqueFilePath(directory string, fileName string) string {
 
 func trimFileStemToLength(stem string, limit int) string {
 	if limit <= 0 {
-		return "note"
+		return "article"
 	}
 
 	runes := []rune(stem)
@@ -452,7 +562,7 @@ func trimFileStemToLength(stem string, limit int) string {
 	trimmed := strings.TrimSpace(string(runes[:limit]))
 	trimmed = strings.Trim(trimmed, ". ")
 	if trimmed == "" {
-		return "note"
+		return "article"
 	}
 
 	if isReservedWindowsName(trimmed) {
@@ -505,6 +615,85 @@ func extractTitle(document string) string {
 	}
 
 	return ""
+}
+
+func extractMarkdownTitle(markdownBody string) string {
+	for _, line := range strings.Split(markdownBody, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
+		}
+		break
+	}
+
+	return ""
+}
+
+func parseQiitaFrontMatter(markdownBody string) (qiitaFrontMatter, string) {
+	const delimiter = "---"
+
+	normalized := strings.ReplaceAll(markdownBody, "\r\n", "\n")
+	if !strings.HasPrefix(normalized, delimiter+"\n") {
+		return qiitaFrontMatter{}, markdownBody
+	}
+
+	rest := normalized[len(delimiter)+1:]
+	end := strings.Index(rest, "\n"+delimiter+"\n")
+	if end < 0 {
+		return qiitaFrontMatter{}, markdownBody
+	}
+
+	rawFrontMatter := rest[:end]
+	body := rest[end+len("\n"+delimiter+"\n"):]
+	return qiitaFrontMatter{
+		Title: parseFrontMatterScalar(rawFrontMatter, "title"),
+	}, body
+}
+
+func parseFrontMatterScalar(frontMatter string, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(frontMatter, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+
+		value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		value = strings.Trim(value, `"'`)
+		return value
+	}
+
+	return ""
+}
+
+func extractQiitaDate(document string, label string) string {
+	pattern := regexp.MustCompile(regexp.QuoteMeta(label) + `\s*([0-9]{4}-[0-9]{2}-[0-9]{2})`)
+	matches := pattern.FindStringSubmatch(document)
+	if len(matches) < 2 {
+		return ""
+	}
+
+	return matches[1]
+}
+
+func isQiitaURL(parsedURL *url.URL) bool {
+	host := strings.ToLower(parsedURL.Hostname())
+	return host == "qiita.com" || host == "www.qiita.com"
+}
+
+func qiitaMarkdownURL(articleURL *url.URL) *url.URL {
+	markdownURL := *articleURL
+	if !strings.HasSuffix(strings.ToLower(markdownURL.Path), ".md") {
+		markdownURL.Path += ".md"
+	}
+	if markdownURL.RawPath != "" && !strings.HasSuffix(strings.ToLower(markdownURL.RawPath), ".md") {
+		markdownURL.RawPath += ".md"
+	}
+
+	return &markdownURL
 }
 
 func extractArticleContent(document string) string {
@@ -600,6 +789,129 @@ func resolveImageMarkdownPath(rawURL string, pageURL *url.URL, client *http.Clie
 	}
 
 	return downloadImage(resolvedURL, client, outputPath, imagesDir)
+}
+
+func replaceMarkdownImages(markdownBody string, pageURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (string, error) {
+	var builder strings.Builder
+	inFence := false
+	fenceRune := rune(0)
+	fenceCount := 0
+
+	for _, segment := range strings.SplitAfter(markdownBody, "\n") {
+		currentFenceRune, currentFenceCount := markdownFenceMarker(segment)
+		if inFence {
+			builder.WriteString(segment)
+			if currentFenceRune == fenceRune && currentFenceCount >= fenceCount {
+				inFence = false
+				fenceRune = 0
+				fenceCount = 0
+			}
+			continue
+		}
+
+		if currentFenceRune != 0 {
+			inFence = true
+			fenceRune = currentFenceRune
+			fenceCount = currentFenceCount
+			builder.WriteString(segment)
+			continue
+		}
+
+		replaced, err := replaceMarkdownImagesInText(segment, pageURL, client, outputPath, imagesDir, noImages)
+		if err != nil {
+			return "", err
+		}
+		builder.WriteString(replaced)
+	}
+
+	return builder.String(), nil
+}
+
+func splitMarkdownImageTarget(target string) (string, string) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", ""
+	}
+
+	if strings.HasPrefix(target, "<") {
+		end := strings.Index(target, ">")
+		if end <= 0 {
+			return "", ""
+		}
+		return strings.TrimSpace(target[1:end]), target[end+1:]
+	}
+
+	for index, r := range target {
+		if unicode.IsSpace(r) {
+			return strings.TrimSpace(target[:index]), target[index:]
+		}
+	}
+
+	return target, ""
+}
+
+func replaceMarkdownImagesInText(text string, pageURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (string, error) {
+	imagePattern := regexp.MustCompile(`!\[([^\]]*)\]\(([^)\r\n]+)\)`)
+	matches := imagePattern.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return text, nil
+	}
+
+	var builder strings.Builder
+	lastIndex := 0
+	for _, match := range matches {
+		builder.WriteString(text[lastIndex:match[0]])
+
+		alt := text[match[2]:match[3]]
+		target := text[match[4]:match[5]]
+		sourceURL, suffix := splitMarkdownImageTarget(target)
+		if sourceURL == "" {
+			builder.WriteString(text[match[0]:match[1]])
+			lastIndex = match[1]
+			continue
+		}
+
+		markdownPath, err := resolveImageMarkdownPath(sourceURL, pageURL, client, outputPath, imagesDir, noImages)
+		if err != nil {
+			return "", err
+		}
+
+		builder.WriteString("![")
+		builder.WriteString(alt)
+		builder.WriteString("](")
+		builder.WriteString(markdownPath)
+		builder.WriteString(suffix)
+		builder.WriteString(")")
+		lastIndex = match[1]
+	}
+
+	builder.WriteString(text[lastIndex:])
+	return builder.String(), nil
+}
+
+func markdownFenceMarker(line string) (rune, int) {
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" {
+		return 0, 0
+	}
+
+	firstRune, _ := utf8.DecodeRuneInString(trimmed)
+	if firstRune != '`' && firstRune != '~' {
+		return 0, 0
+	}
+
+	count := 0
+	for _, r := range trimmed {
+		if r != firstRune {
+			break
+		}
+		count++
+	}
+	if count < 3 {
+		return 0, 0
+	}
+
+	return firstRune, count
 }
 
 func extractImageSource(tag string) string {
@@ -797,6 +1109,45 @@ func htmlToMarkdown(fragment string) string {
 	}
 
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func normalizeMarkdownContent(markdownBody string) string {
+	markdownBody = strings.ReplaceAll(markdownBody, "\r\n", "\n")
+	return strings.TrimSpace(markdownBody)
+}
+
+func normalizeQiitaMarkdown(markdownBody string, title string) string {
+	markdownBody = normalizeMarkdownContent(markdownBody)
+	markdownBody = trimDuplicateHeading(markdownBody, title)
+
+	lines := strings.Split(markdownBody, "\n")
+	for index, line := range lines {
+		lines[index] = normalizeQiitaHeadingLine(line)
+	}
+
+	result := strings.Join(lines, "\n")
+	result = regexp.MustCompile(`\n{3,}`).ReplaceAllString(result, "\n\n")
+	return strings.TrimSpace(result)
+}
+
+func normalizeQiitaHeadingLine(line string) string {
+	pattern := regexp.MustCompile(`^(#{1,6}) \(\#[^)]+\)(.+)$`)
+	matches := pattern.FindStringSubmatch(line)
+	if len(matches) == 3 {
+		return matches[1] + " " + strings.TrimSpace(matches[2])
+	}
+
+	return line
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+
+	return ""
 }
 
 func cleanInlineHTML(value string) string {

@@ -1,13 +1,14 @@
 # note2md
 
-`note.com` の記事 URL を Markdown に変換する小さな CLI ツールです。
+`note.com` と `Qiita` の記事 URL を Markdown に変換する小さな CLI ツールです。
 
-Version: `0.9.2`
+Version: `0.9.3`
 
 主な機能:
 
 - `note.com` の記事本文を Markdown 化
-- 最初の画像を取得して Markdown に埋め込み
+- `Qiita` の記事本文を `.md` エンドポイントからそのまま取得
+- 画像を取得して Markdown に埋め込み
 - `--no-images` で画像取得を無効化し、元画像 URL をそのまま使用
 - URL を1行ずつ書いたファイルを読み込んで連続処理
 - 出力ファイル名は記事タイトルから自動生成
@@ -33,6 +34,10 @@ go build ./...
 .\note2md.exe https://note.com/example/n/abcdef123456
 ```
 
+```powershell
+.\note2md.exe https://qiita.com/spumoni/items/c2159cff7436b1f9a17c
+```
+
 出力ファイルを明示:
 
 ```powershell
@@ -49,6 +54,10 @@ Markdown を標準出力へ出す:
 
 ```powershell
 .\note2md.exe --no-images https://note.com/example/n/abcdef123456
+```
+
+```powershell
+.\note2md.exe --no-images https://qiita.com/spumoni/items/c2159cff7436b1f9a17c
 ```
 
 URL リストを連続処理:
@@ -87,13 +96,15 @@ URL リストを連続処理:
 
 - 本文は最初の `<div data-note-id=...>` ブロックを優先して抽出します。
 - 最初の `<img>` だけを画像として特別処理します。
+- `Qiita` は記事 URL の末尾に `.md` を付けて Markdown を取得します。
+- `Qiita` の Markdown 内にある画像リンクはすべてローカル保存対象になります。
 - `hr` は Markdown の `---` に変換します。
 - 先頭の著者名と日時の並びは、note の記事表示に合わせて整形します。
 
 ## Known Limitations
 
 - 埋め込みカードや `figure` は専用対応していません。
-- 画像の特別処理は最初の1枚だけです。
+- `note.com` 側の画像特別処理は最初の1枚だけです。
 - 記事の HTML 構造が大きく変わると抽出結果が崩れる可能性があります。
 
 ## Author
