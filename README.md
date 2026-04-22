@@ -2,7 +2,7 @@
 
 `note.com` と `Qiita` の記事 URL を Markdown に変換する小さな CLI ツールです。
 
-Version: `0.9.3`
+Version: `0.9.4`
 
 主な機能:
 

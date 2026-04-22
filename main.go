@@ -45,7 +45,7 @@ type qiitaArticleMeta struct {
 }
 
 const maxFileStemRunes = 80
-const version = "0.9.3"
+const version = "0.9.4"
 const emptyArticleBodyMessage = "_No article body could be extracted from the page._"
 
 var invalidFileNameRuneMap = map[rune]rune{
@@ -753,29 +753,32 @@ func extractNoteContent(document string) string {
 
 func replaceFirstImageWithMarkdown(fragment string, pageURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (string, error) {
 	imagePattern := regexp.MustCompile(`(?is)<img\b[^>]*>`)
-	location := imagePattern.FindStringIndex(fragment)
-	if location == nil {
-		return fragment, nil
+	locations := imagePattern.FindAllStringIndex(fragment, -1)
+	for _, location := range locations {
+		tag := fragment[location[0]:location[1]]
+		sourceURL := extractImageSource(tag)
+		if sourceURL == "" {
+			continue
+		}
+		if isDataImageURL(sourceURL, pageURL) {
+			continue
+		}
+
+		markdownPath, err := resolveImageMarkdownPath(sourceURL, pageURL, client, outputPath, imagesDir, noImages)
+		if err != nil {
+			return "", err
+		}
+
+		alt := extractImageAlt(tag)
+		if alt == "" {
+			alt = "image"
+		}
+		imageMarkdown := "\n\n![" + alt + "](" + markdownPath + ")\n\n"
+
+		return fragment[:location[0]] + imageMarkdown + fragment[location[1]:], nil
 	}
 
-	tag := fragment[location[0]:location[1]]
-	sourceURL := extractImageSource(tag)
-	if sourceURL == "" {
-		return fragment, nil
-	}
-
-	markdownPath, err := resolveImageMarkdownPath(sourceURL, pageURL, client, outputPath, imagesDir, noImages)
-	if err != nil {
-		return "", err
-	}
-
-	alt := extractImageAlt(tag)
-	if alt == "" {
-		alt = "image"
-	}
-	imageMarkdown := "\n\n![" + alt + "](" + markdownPath + ")\n\n"
-
-	return fragment[:location[0]] + imageMarkdown + fragment[location[1]:], nil
+	return fragment, nil
 }
 
 func resolveImageMarkdownPath(rawURL string, pageURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (string, error) {
@@ -787,8 +790,20 @@ func resolveImageMarkdownPath(rawURL string, pageURL *url.URL, client *http.Clie
 	if noImages {
 		return resolvedURL.String(), nil
 	}
+	if strings.EqualFold(resolvedURL.Scheme, "data") {
+		return resolvedURL.String(), nil
+	}
 
 	return downloadImage(resolvedURL, client, outputPath, imagesDir)
+}
+
+func isDataImageURL(rawURL string, pageURL *url.URL) bool {
+	resolvedURL, err := pageURL.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(resolvedURL.Scheme, "data")
 }
 
 func replaceMarkdownImages(markdownBody string, pageURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (string, error) {
@@ -1070,6 +1085,8 @@ func isSupportedImageExtension(extension string) bool {
 }
 
 func htmlToMarkdown(fragment string) string {
+	fragment = rewriteRubyMarkup(fragment)
+
 	replacements := []struct {
 		pattern *regexp.Regexp
 		value   string
@@ -1109,6 +1126,66 @@ func htmlToMarkdown(fragment string) string {
 	}
 
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func rewriteRubyMarkup(fragment string) string {
+	rubyPattern := regexp.MustCompile(`(?is)<ruby\b[^>]*>(.*?)</ruby>`)
+	rtPattern := regexp.MustCompile(`(?is)<rt\b[^>]*>(.*?)</rt>`)
+	rpPattern := regexp.MustCompile(`(?is)</?rp\b[^>]*>`)
+	rubyLeader := preferredRubyLeader(fragment)
+
+	return rubyPattern.ReplaceAllStringFunc(fragment, func(ruby string) string {
+		rtMatches := rtPattern.FindAllStringSubmatch(ruby, -1)
+		if len(rtMatches) == 0 {
+			return ruby
+		}
+
+		readings := make([]string, 0, len(rtMatches))
+		for _, match := range rtMatches {
+			if len(match) < 2 {
+				continue
+			}
+			reading := cleanInlineHTML(match[1])
+			if reading != "" {
+				readings = append(readings, reading)
+			}
+		}
+		if len(readings) == 0 {
+			return ruby
+		}
+
+		base := rtPattern.ReplaceAllString(ruby, "")
+		base = rpPattern.ReplaceAllString(base, "")
+		base = regexp.MustCompile(`(?is)</?ruby\b[^>]*>`).ReplaceAllString(base, "")
+		base = cleanInlineHTML(base)
+		if base == "" {
+			return ruby
+		}
+
+		return rubyLeader + base + "《" + strings.Join(readings, "／") + "》"
+	})
+}
+
+func preferredRubyLeader(fragment string) string {
+	pattern := regexp.MustCompile(`[｜|][^《\n]{1,100}《`)
+	matches := pattern.FindAllString(fragment, -1)
+	fullWidthCount := 0
+	halfWidthCount := 0
+	for _, match := range matches {
+		if strings.HasPrefix(match, "｜") {
+			fullWidthCount++
+			continue
+		}
+		if strings.HasPrefix(match, "|") {
+			halfWidthCount++
+		}
+	}
+
+	if halfWidthCount > fullWidthCount {
+		return "|"
+	}
+
+	return "｜"
 }
 
 func normalizeMarkdownContent(markdownBody string) string {

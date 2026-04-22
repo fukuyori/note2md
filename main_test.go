@@ -66,6 +66,31 @@ func TestTrimFileStemToLengthPreservesRuneBoundaries(t *testing.T) {
 	}
 }
 
+func TestDefaultOutputPathTrimsLongTitle(t *testing.T) {
+	tempDir := t.TempDir()
+
+	previousWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() {
+		if chdirErr := os.Chdir(previousWD); chdirErr != nil {
+			t.Fatalf("restore working directory: %v", chdirErr)
+		}
+	}()
+
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir temp dir: %v", err)
+	}
+
+	title := strings.Repeat("あ", maxFileStemRunes+20)
+	got := defaultOutputPath("https://note.com/fukuy/n/example", title)
+	want := strings.Repeat("あ", maxFileStemRunes) + ".md"
+	if got != want {
+		t.Fatalf("defaultOutputPath() = %q, want %q", got, want)
+	}
+}
+
 func TestMakeUniqueFilePathAddsSuffixOnCollision(t *testing.T) {
 	t.Parallel()
 
@@ -271,6 +296,173 @@ func TestNormalizeQiitaMarkdownRemovesHeadingSelfLinks(t *testing.T) {
 	}
 }
 
+func TestHTMLToMarkdownRewritesRubyMarkup(t *testing.T) {
+	t.Parallel()
+
+	input := "<p><ruby>御代<rt>おほむとき</rt></ruby></p>"
+	got := htmlToMarkdown(input)
+	want := "｜御代《おほむとき》"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownRewritesRubyMarkupWithHalfWidthLeaderWhenPresent(t *testing.T) {
+	t.Parallel()
+
+	input := "<p>|既存《きそん》の表記です。</p><p><ruby>御代<rt>おほむとき</rt></ruby></p>"
+	got := htmlToMarkdown(input)
+	want := "|既存《きそん》の表記です。\n\n|御代《おほむとき》"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeNoteMarkdownKeepsWrappedParagraphs(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"いづれの｜御代《おほむとき》にか、",
+		"｜女御《にょうご》・｜更衣《かうい》あまたさぶらひ給ひける中に、",
+		"いとやむごとなき｜際《きは》にはあらぬが、",
+		"すぐれて時めき給ふありけり。",
+		"",
+		"もとより、",
+		"われこそはと思ひ上がり給へる御方がた、",
+		"｜めざましき《めざわり》ものに見て、",
+		"｜貶《おとし》め、",
+		"｜嫉《そね》み給ふ。",
+	}, "\n")
+
+	got := normalizeNoteMarkdown(input)
+	want := strings.Join([]string{
+		"いづれの｜御代《おほむとき》にか、",
+		"｜女御《にょうご》・｜更衣《かうい》あまたさぶらひ給ひける中に、",
+		"いとやむごとなき｜際《きは》にはあらぬが、",
+		"すぐれて時めき給ふありけり。",
+		"",
+		"もとより、",
+		"われこそはと思ひ上がり給へる御方がた、",
+		"｜めざましき《めざわり》ものに見て、",
+		"｜貶《おとし》め、",
+		"｜嫉《そね》み給ふ。",
+	}, "\n")
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeNoteMarkdownKeepsWrappedParagraphsWithHalfWidthRubyLeader(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"いづれの|御代《おほむとき》にか、",
+		"|女御《にょうご》・|更衣《かうい》あまたさぶらひ給ひける中に、",
+		"いとやむごとなき|際《きは》にはあらぬが、",
+		"すぐれて時めき給ふありけり。",
+	}, "\n")
+
+	got := normalizeNoteMarkdown(input)
+	want := input
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeNoteMarkdownKeepsTwoLineBulletItem(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"- 原文の内容・構成・意味を損なわないことを最優先とし、",
+		"省略や恣意的な改変は行っていない。",
+	}, "\n")
+
+	got := normalizeNoteMarkdown(input)
+	want := input
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNoteFormattingMatchesExpectedExcerpt(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"<p>いづれの<ruby>御代<rt>おほむとき</rt></ruby>にか、<br><ruby>女御<rt>にょうご</rt></ruby>・<ruby>更衣<rt>かうい</rt></ruby>あまたさぶらひ給ひける中に、<br>いとやむごとなき<ruby>際<rt>きは</rt></ruby>にはあらぬが、<br>すぐれて時めき給ふありけり。</p>",
+		"<p>もとより、<br>われこそはと思ひ上がり給へる御方がた、<br><ruby>めざましき<rt>めざわり</rt></ruby>ものに見て、<br><ruby>貶<rt>おとし</rt></ruby>め、<br><ruby>嫉<rt>そね</rt></ruby>み給ふ。</p>",
+		"<p>同じほどの更衣たちも、<br>なほ心やすからず。<br>まして、<br>それより<ruby>下臈<rt>げらふ</rt></ruby>の更衣たちは、<br>いとど耐へがたく思ひけり。</p>",
+		"<p>朝夕の宮仕へにつけても、<br>人の心をのみ動かし、<br>恨みを負ふ積もりにやありけむ、<br>いと<ruby>篤<rt>あつ</rt></ruby>しくなりゆき、<br>もの心ぼそげに、<br>里がちなるを、<br>いよいよあかず、<br>あはれなるものに思ほして、<br>人のそしりをもえ<ruby>憚<rt>はばか</rt></ruby>らせ給はず、<br>世のためしにもなりぬべき御もてなしなり。</p>",
+		"<p><ruby>上達部<rt>かむだちめ</rt></ruby>、<ruby>上人<rt>うへびと</rt></ruby>なども、<br>あひなく目をそばめつつ、<br>いとまばゆき人の御おぼえなり。</p>",
+		"<p><ruby>唐土<rt>もろこし</rt></ruby>にも、<br>かかる事の起こりにこそ、<br>世も乱れ、<br>あしかりけれと、<br>やうやう<ruby>天<rt>あめ</rt></ruby>の下にも、<br><ruby>あぢきなう<rt>どうしようもなく</rt></ruby>人のもてなやみ草となりて、<br>楊貴妃の<ruby>例<rt>ためし</rt></ruby>も引き出でつべくなりゆくに、<br>いとはしたなき事多かれど、<br>かたじけなき御心ばへの、<br>たぐひなきを頼みにて、<br>まじらひ給ふ。</p>",
+		"<p>父の大納言は亡くなりて、<br>母北の方なむ、<br>いにしへの人のよしあるにて、<br>親うち具し、<br>さしあたりて、<br>世のおぼえはなやかなる御方がたにも、<br>いたう劣らず、<br>なにごとの儀式をも、<br>もてなし給ひけれど、<br>とりたてて、<br>はかばかしき<ruby>後見<rt>うしろみ</rt></ruby>しなければ、<br>事ある時は、<br>なほ<ruby>拠<rt>より</rt></ruby>り所なく、<br>心ぼそげなり。</p>",
+	}, "")
+
+	got := normalizeNoteMarkdown(htmlToMarkdown(input))
+	want := strings.Join([]string{
+		"いづれの｜御代《おほむとき》にか、",
+		"｜女御《にょうご》・｜更衣《かうい》あまたさぶらひ給ひける中に、",
+		"いとやむごとなき｜際《きは》にはあらぬが、",
+		"すぐれて時めき給ふありけり。",
+		"",
+		"もとより、",
+		"われこそはと思ひ上がり給へる御方がた、",
+		"｜めざましき《めざわり》ものに見て、",
+		"｜貶《おとし》め、",
+		"｜嫉《そね》み給ふ。",
+		"",
+		"同じほどの更衣たちも、",
+		"なほ心やすからず。",
+		"まして、",
+		"それより｜下臈《げらふ》の更衣たちは、",
+		"いとど耐へがたく思ひけり。",
+		"",
+		"朝夕の宮仕へにつけても、",
+		"人の心をのみ動かし、",
+		"恨みを負ふ積もりにやありけむ、",
+		"いと｜篤《あつ》しくなりゆき、",
+		"もの心ぼそげに、",
+		"里がちなるを、",
+		"いよいよあかず、",
+		"あはれなるものに思ほして、",
+		"人のそしりをもえ｜憚《はばか》らせ給はず、",
+		"世のためしにもなりぬべき御もてなしなり。",
+		"",
+		"｜上達部《かむだちめ》、｜上人《うへびと》なども、",
+		"あひなく目をそばめつつ、",
+		"いとまばゆき人の御おぼえなり。",
+		"",
+		"｜唐土《もろこし》にも、",
+		"かかる事の起こりにこそ、",
+		"世も乱れ、",
+		"あしかりけれと、",
+		"やうやう｜天《あめ》の下にも、",
+		"｜あぢきなう《どうしようもなく》人のもてなやみ草となりて、",
+		"楊貴妃の｜例《ためし》も引き出でつべくなりゆくに、",
+		"いとはしたなき事多かれど、",
+		"かたじけなき御心ばへの、",
+		"たぐひなきを頼みにて、",
+		"まじらひ給ふ。",
+		"",
+		"父の大納言は亡くなりて、",
+		"母北の方なむ、",
+		"いにしへの人のよしあるにて、",
+		"親うち具し、",
+		"さしあたりて、",
+		"世のおぼえはなやかなる御方がたにも、",
+		"いたう劣らず、",
+		"なにごとの儀式をも、",
+		"もてなし給ひけれど、",
+		"とりたてて、",
+		"はかばかしき｜後見《うしろみ》しなければ、",
+		"事ある時は、",
+		"なほ｜拠《より》り所なく、",
+		"心ぼそげなり。",
+	}, "\n")
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown(htmlToMarkdown(input)) = %q, want %q", got, want)
+	}
+}
+
 func TestReplaceMarkdownImagesSkipsCodeFences(t *testing.T) {
 	t.Parallel()
 
@@ -301,5 +493,64 @@ func TestReplaceMarkdownImagesSkipsCodeFences(t *testing.T) {
 
 	if imageRequests != 0 {
 		t.Fatalf("image requests = %d, want 0", imageRequests)
+	}
+}
+
+func TestReplaceFirstImageWithMarkdownSkipsDataImageAndUsesNextImage(t *testing.T) {
+	t.Parallel()
+
+	imageRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		imageRequests++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("png"))
+	}))
+	defer server.Close()
+
+	pageURL, err := url.Parse("https://note.com/fukuy/n/example")
+	if err != nil {
+		t.Fatalf("parse page URL: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	outputPath := filepath.Join(t.TempDir(), "article.md")
+	fragment := `<p><img src="data:image/svg+xml,%3Csvg%3E%3C/svg%3E" alt="placeholder"><img src="` + server.URL + `/hero.png" alt="hero"></p>`
+
+	got, err := replaceFirstImageWithMarkdown(fragment, pageURL, client, outputPath, "images", false)
+	if err != nil {
+		t.Fatalf("replaceFirstImageWithMarkdown() error = %v", err)
+	}
+
+	if imageRequests != 1 {
+		t.Fatalf("image requests = %d, want 1", imageRequests)
+	}
+
+	if !strings.Contains(got, `src="data:image/svg+xml,%3Csvg%3E%3C/svg%3E"`) {
+		t.Fatalf("replaceFirstImageWithMarkdown() should keep placeholder img in fragment, got %q", got)
+	}
+
+	if !strings.Contains(got, "![hero](images/hero.png)") {
+		t.Fatalf("replaceFirstImageWithMarkdown() missing rewritten image markdown in %q", got)
+	}
+}
+
+func TestReplaceMarkdownImagesKeepsDataImagesWithoutDownloading(t *testing.T) {
+	t.Parallel()
+
+	pageURL, err := url.Parse("https://qiita.com/spumoni/items/example")
+	if err != nil {
+		t.Fatalf("parse page URL: %v", err)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	markdown := "![placeholder](data:image/svg+xml,%3Csvg%3E%3C/svg%3E)\n"
+
+	got, err := replaceMarkdownImages(markdown, pageURL, client, filepath.Join(t.TempDir(), "article.md"), "images", false)
+	if err != nil {
+		t.Fatalf("replaceMarkdownImages() error = %v", err)
+	}
+
+	if got != markdown {
+		t.Fatalf("replaceMarkdownImages() = %q, want %q", got, markdown)
 	}
 }
