@@ -2,7 +2,7 @@
 
 `note.com` と `Qiita` の記事 URL を Markdown に変換する小さな CLI ツールです。
 
-Version: `0.9.4`
+Version: `0.9.5`
 
 主な機能:
 
@@ -99,6 +99,7 @@ URL リストを連続処理:
 - `Qiita` は記事 URL の末尾に `.md` を付けて Markdown を取得します。
 - `Qiita` の Markdown 内にある画像リンクはすべてローカル保存対象になります。
 - `hr` は Markdown の `---` に変換します。
+- ルビは純粋な Markdown 記法ではなく、note が使う `｜語句《よみ》` または `|語句《よみ》` の表記を優先して出力します。
 - 先頭の著者名と日時の並びは、note の記事表示に合わせて整形します。
 
 ## Known Limitations

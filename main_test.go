@@ -318,6 +318,188 @@ func TestHTMLToMarkdownRewritesRubyMarkupWithHalfWidthLeaderWhenPresent(t *testi
 	}
 }
 
+func TestHTMLToMarkdownConvertsStrongAndStrike(t *testing.T) {
+	t.Parallel()
+
+	input := "<p>重要な<strong>箇所</strong>と<s>古い表現</s>です。</p>"
+	got := htmlToMarkdown(input)
+	want := "重要な**箇所**と~~古い表現~~です。"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsEmphasisAndInlineCode(t *testing.T) {
+	t.Parallel()
+
+	input := "<p><em>強調</em>と<code>fmt.Println(&quot;note&quot;)</code>です。</p>"
+	got := htmlToMarkdown(input)
+	want := "*強調*と`fmt.Println(\"note\")`です。"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsInlineLinksToMarkdownLinks(t *testing.T) {
+	t.Parallel()
+
+	input := `<p><a href="https://example.com/page">参考ページ</a>を参照してください。</p>`
+	got := htmlToMarkdown(input)
+	want := "[参考ページ](https://example.com/page)を参照してください。"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownKeepsEmptyAnchorsCompatibleForAuthorRewrite(t *testing.T) {
+	t.Parallel()
+
+	input := `<p><a href="/akihamitsuki"></a></p>`
+	got := htmlToMarkdown(input)
+	want := "(/akihamitsuki)"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsBlockquote(t *testing.T) {
+	t.Parallel()
+
+	input := "<blockquote><p>引用文です。</p><p>2行目です。</p></blockquote>"
+	got := htmlToMarkdown(input)
+	want := "> 引用文です。\n>\n> 2行目です。"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsOrderedList(t *testing.T) {
+	t.Parallel()
+
+	input := "<ol><li>最初</li><li>次</li><li>最後</li></ol>"
+	got := htmlToMarkdown(input)
+	want := "1. 最初\n2. 次\n3. 最後"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsNestedUnorderedList(t *testing.T) {
+	t.Parallel()
+
+	input := "<ul><li><p>イヌ科</p><ul><li><p>柴犬</p></li><li><p>秋田犬</p></li></ul></li><li><p>ネコ科</p><ul><li><p>三毛猫</p></li></ul></li></ul>"
+	got := htmlToMarkdown(input)
+	want := "- イヌ科\n  - 柴犬\n  - 秋田犬\n- ネコ科\n  - 三毛猫"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsNestedOrderedList(t *testing.T) {
+	t.Parallel()
+
+	input := "<ol><li><p>手順</p><ol><li><p>準備</p></li><li><p>実行</p></li></ol></li><li><p>完了</p></li></ol>"
+	got := htmlToMarkdown(input)
+	want := "1. 手順\n  1. 準備\n  2. 実行\n2. 完了"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsCodeBlock(t *testing.T) {
+	t.Parallel()
+
+	input := "<pre><code>const name = &quot;note&quot;;\nconsole.log(name);</code></pre>"
+	got := htmlToMarkdown(input)
+	want := "```\nconst name = \"note\";\nconsole.log(name);\n```"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownUsesLongerFenceWhenCodeContainsTripleBackticks(t *testing.T) {
+	t.Parallel()
+
+	input := "<pre><code>```\nconst name = &quot;note&quot;;\n```</code></pre>"
+	got := htmlToMarkdown(input)
+	want := "````\n```\nconst name = \"note\";\n```\n````"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsExternalArticleFigure(t *testing.T) {
+	t.Parallel()
+
+	input := `<figure embedded-service="external-article" data-src="https://example.com/article"><div class="external-article-widget"><a href="https://example.com/article"><strong class="external-article-widget-title">記事タイトル</strong><em class="external-article-widget-description">概要文です。</em><em class="external-article-widget-url">example.com</em></a></div></figure>`
+	got := htmlToMarkdown(input)
+	want := "[記事タイトル](https://example.com/article)\n\n概要文です。\n\nexample.com"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsFigureWithQuoteAndCaption(t *testing.T) {
+	t.Parallel()
+
+	input := `<figure><blockquote><p>「## ＋ 半角スペース」で大見出し<br>「### ＋ 半角スペース」で小見出し</p></blockquote><figcaption><a href="https://www.help-note.com/example">Markdownショートカット - noteヘルプセンター</a></figcaption></figure>`
+	got := htmlToMarkdown(input)
+	want := "> 「## ＋ 半角スペース」で大見出し\n> 「### ＋ 半角スペース」で小見出し\n\n[Markdownショートカット - noteヘルプセンター](https://www.help-note.com/example)"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsEmbeddedNoteFigureToStandaloneURL(t *testing.T) {
+	t.Parallel()
+
+	input := `<p>前文です。</p><figure embedded-service="note" data-src="https://note.com/example/n/embedded"><div><iframe data-src="https://note.com/embed/notes/embedded"></iframe><a href="https://note.com/example/n/embedded" target="_blank" rel="noopener"></a></div></figure><p>後文です。</p>`
+	got := htmlToMarkdown(input)
+	want := "前文です。\n\nhttps://note.com/example/n/embedded\n\n後文です。"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestHTMLToMarkdownConvertsListLinksToMarkdownLinks(t *testing.T) {
+	t.Parallel()
+
+	input := `<ul><li><p><a href="https://www.help-note.com/example">Markdownショートカット - noteヘルプセンター</a></p></li></ul>`
+	got := htmlToMarkdown(input)
+	want := "- [Markdownショートカット - noteヘルプセンター](https://www.help-note.com/example)"
+	if got != want {
+		t.Fatalf("htmlToMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestEnrichEmbeddedNoteFiguresAddsFetchedCaption(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/embedded":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!doctype html><html><head><meta property="og:title" content="埋め込み先タイトル｜著者名"></head><body></body></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	input := `<figure embedded-service="note" data-src="` + server.URL + `/embedded"><div><iframe data-src="` + server.URL + `/embed"></iframe></div></figure>`
+
+	got, err := enrichEmbeddedNoteFigures(input, client)
+	if err != nil {
+		t.Fatalf("enrichEmbeddedNoteFigures() error = %v", err)
+	}
+
+	want := `<figcaption><a href="` + server.URL + `/embedded" target="_blank" rel="noopener nofollow">埋め込み先タイトル</a></figcaption>`
+	if !strings.Contains(got, want) {
+		t.Fatalf("enrichEmbeddedNoteFigures() = %q, want substring %q", got, want)
+	}
+}
+
 func TestNormalizeNoteMarkdownKeepsWrappedParagraphs(t *testing.T) {
 	t.Parallel()
 
@@ -379,6 +561,58 @@ func TestNormalizeNoteMarkdownKeepsTwoLineBulletItem(t *testing.T) {
 
 	got := normalizeNoteMarkdown(input)
 	want := input
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeNoteMarkdownMergesAdjacentListBlocks(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"- ネコ科",
+		"  - 三毛猫",
+		"",
+		"- ヒト科",
+	}, "\n")
+
+	got := normalizeNoteMarkdown(input)
+	want := strings.Join([]string{
+		"- ネコ科",
+		"  - 三毛猫",
+		"- ヒト科",
+	}, "\n")
+	if got != want {
+		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeNoteMarkdownRewritesInlineAuthorMetadataBlock(t *testing.T) {
+	t.Parallel()
+
+	input := strings.Join([]string{
+		"# noteで使えるマークダウン記法まとめ",
+		"",
+		"**",
+		"190",
+		"[](/akihamitsuki) [宮野秋彦](/akihamitsuki) 2023年6月18日 11:31     noteエディタとマークダウンの関係について調べたので、そのまとめです。",
+		"",
+		"別エディタでnoteの下書きをしたり、ChatGPTで出力した要素をnoteに貼り付ける場合などには、どのような対応関係なのかを知っておくと、ちょっとだけ便利です。",
+	}, "\n")
+
+	got := normalizeNoteMarkdown(input)
+	want := strings.Join([]string{
+		"# noteで使えるマークダウン記法まとめ",
+		"",
+		"宮野秋彦",
+		"2023年6月18日 11:31",
+		"",
+		"---",
+		"",
+		"noteエディタとマークダウンの関係について調べたので、そのまとめです。",
+		"",
+		"別エディタでnoteの下書きをしたり、ChatGPTで出力した要素をnoteに貼り付ける場合などには、どのような対応関係なのかを知っておくと、ちょっとだけ便利です。",
+	}, "\n")
 	if got != want {
 		t.Fatalf("normalizeNoteMarkdown() = %q, want %q", got, want)
 	}

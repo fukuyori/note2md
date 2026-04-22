@@ -45,7 +45,7 @@ type qiitaArticleMeta struct {
 }
 
 const maxFileStemRunes = 80
-const version = "0.9.4"
+const version = "0.9.5"
 const emptyArticleBodyMessage = "_No article body could be extracted from the page._"
 
 var invalidFileNameRuneMap = map[rune]rune{
@@ -288,6 +288,11 @@ func convertHTMLArticleURL(parsedURL *url.URL, client *http.Client, outputPath s
 		content = extractArticleContent(document)
 	}
 
+	content, err = enrichEmbeddedNoteFigures(content, client)
+	if err != nil {
+		return convertedNote{}, err
+	}
+
 	content, err = replaceFirstImageWithMarkdown(content, parsedURL, client, outputPath, imagesDir, noImages)
 	if err != nil {
 		return convertedNote{}, err
@@ -298,6 +303,71 @@ func convertHTMLArticleURL(parsedURL *url.URL, client *http.Client, outputPath s
 	markdownBody = normalizeNoteMarkdown(markdownBody)
 
 	return buildConvertedArticle(parsedURL, title, markdownBody), nil
+}
+
+func enrichEmbeddedNoteFigures(fragment string, client *http.Client) (string, error) {
+	figurePattern := regexp.MustCompile(`(?is)<figure\b[^>]*embedded-service=["']note["'][^>]*>.*?</figure>`)
+	matches := figurePattern.FindAllStringIndex(fragment, -1)
+	if len(matches) == 0 {
+		return fragment, nil
+	}
+
+	titleCache := make(map[string]string)
+	var builder strings.Builder
+	lastIndex := 0
+
+	for _, match := range matches {
+		builder.WriteString(fragment[lastIndex:match[0]])
+		block := fragment[match[0]:match[1]]
+		enriched, err := enrichSingleEmbeddedNoteFigure(block, client, titleCache)
+		if err != nil {
+			return "", err
+		}
+		builder.WriteString(enriched)
+		lastIndex = match[1]
+	}
+
+	builder.WriteString(fragment[lastIndex:])
+	return builder.String(), nil
+}
+
+func enrichSingleEmbeddedNoteFigure(block string, client *http.Client, titleCache map[string]string) (string, error) {
+	targetURL := firstNonEmpty(
+		extractTagAttribute(block, "data-src"),
+		extractFirstHref(block),
+	)
+	if targetURL == "" {
+		return block, nil
+	}
+	if strings.Contains(strings.ToLower(block), "<figcaption") {
+		return block, nil
+	}
+
+	title, ok := titleCache[targetURL]
+	if !ok {
+		parsedURL, err := url.Parse(targetURL)
+		if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+			return block, nil
+		}
+
+		document, err := fetchText(client, parsedURL)
+		if err != nil {
+			return block, nil
+		}
+		title = normalizeDocumentTitle(extractTitle(document))
+		titleCache[targetURL] = title
+	}
+	if title == "" {
+		return block, nil
+	}
+
+	insertAt := strings.LastIndex(strings.ToLower(block), "</figure>")
+	if insertAt < 0 {
+		return block, nil
+	}
+
+	caption := `<figcaption><a href="` + html.EscapeString(targetURL) + `" target="_blank" rel="noopener nofollow">` + html.EscapeString(title) + `</a></figcaption>`
+	return block[:insertAt] + caption + block[insertAt:], nil
 }
 
 func convertQiitaURL(articleURL *url.URL, client *http.Client, outputPath string, imagesDir string, noImages bool) (convertedNote, error) {
@@ -1086,6 +1156,7 @@ func isSupportedImageExtension(extension string) bool {
 
 func htmlToMarkdown(fragment string) string {
 	fragment = rewriteRubyMarkup(fragment)
+	fragment, placeholders := extractMarkdownPlaceholders(fragment)
 
 	replacements := []struct {
 		pattern *regexp.Regexp
@@ -1093,6 +1164,13 @@ func htmlToMarkdown(fragment string) string {
 	}{
 		{regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`), ""},
 		{regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`), ""},
+		{regexp.MustCompile(`(?is)<strong\b[^>]*>(.*?)</strong>`), `**$1**`},
+		{regexp.MustCompile(`(?is)<b\b[^>]*>(.*?)</b>`), `**$1**`},
+		{regexp.MustCompile(`(?is)<em\b[^>]*>(.*?)</em>`), `*$1*`},
+		{regexp.MustCompile(`(?is)<i\b[^>]*>(.*?)</i>`), `*$1*`},
+		{regexp.MustCompile(`(?is)<del\b[^>]*>(.*?)</del>`), `~~$1~~`},
+		{regexp.MustCompile(`(?is)<strike\b[^>]*>(.*?)</strike>`), `~~$1~~`},
+		{regexp.MustCompile(`(?is)<s\b[^>]*>(.*?)</s>`), `~~$1~~`},
 		{regexp.MustCompile(`(?is)<hr\b[^>]*>`), "\n\n---\n\n"},
 		{regexp.MustCompile(`(?is)<br\s*/?>`), "\n"},
 		{regexp.MustCompile(`(?is)</p>`), "\n\n"},
@@ -1107,7 +1185,6 @@ func htmlToMarkdown(fragment string) string {
 		{regexp.MustCompile(`(?is)</li>`), "\n"},
 		{regexp.MustCompile(`(?is)<li[^>]*>`), "- "},
 		{regexp.MustCompile(`(?is)</?(ul|ol)[^>]*>`), "\n"},
-		{regexp.MustCompile(`(?is)<a[^>]+href=["'](.*?)["'][^>]*>(.*?)</a>`), "$2 ($1)"},
 	}
 
 	content := fragment
@@ -1115,6 +1192,8 @@ func htmlToMarkdown(fragment string) string {
 		content = replacement.pattern.ReplaceAllString(content, replacement.value)
 	}
 
+	content = rewriteInlineCode(content)
+	content = rewriteAnchorTags(content)
 	content = regexp.MustCompile(`(?is)<[^>]+>`).ReplaceAllString(content, "")
 	content = html.UnescapeString(content)
 	content = strings.ReplaceAll(content, "\r\n", "\n")
@@ -1125,7 +1204,81 @@ func htmlToMarkdown(fragment string) string {
 		lines[index] = strings.TrimSpace(line)
 	}
 
-	return strings.TrimSpace(strings.Join(lines, "\n"))
+	content = strings.TrimSpace(strings.Join(lines, "\n"))
+	return restoreMarkdownPlaceholders(content, placeholders)
+}
+
+func rewriteInlineCode(fragment string) string {
+	codePattern := regexp.MustCompile(`(?is)<code\b[^>]*>(.*?)</code>`)
+
+	return codePattern.ReplaceAllStringFunc(fragment, func(block string) string {
+		matches := codePattern.FindStringSubmatch(block)
+		if len(matches) < 2 {
+			return block
+		}
+
+		content := html.UnescapeString(matches[1])
+		content = strings.ReplaceAll(content, "\r\n", "\n")
+		content = strings.ReplaceAll(content, "\n", " ")
+		return wrapInlineCode(strings.TrimSpace(content))
+	})
+}
+
+func rewriteAnchorTags(fragment string) string {
+	anchorPattern := regexp.MustCompile(`(?is)<a\b[^>]*href=["'](.*?)["'][^>]*>(.*?)</a>`)
+
+	return anchorPattern.ReplaceAllStringFunc(fragment, func(block string) string {
+		matches := anchorPattern.FindStringSubmatch(block)
+		if len(matches) < 3 {
+			return block
+		}
+
+		targetURL := html.UnescapeString(strings.TrimSpace(matches[1]))
+		label := strings.TrimSpace(matches[2])
+		if targetURL == "" {
+			return cleanInlineHTML(label)
+		}
+		if label == "" {
+			return "(" + targetURL + ")"
+		}
+
+		if cleanInlineHTML(label) == targetURL {
+			return targetURL
+		}
+
+		return "[" + label + "](" + targetURL + ")"
+	})
+}
+
+func wrapInlineCode(content string) string {
+	if content == "" {
+		return "``"
+	}
+
+	maxTicks := longestBacktickRun(content)
+	fence := strings.Repeat("`", maxTicks+1)
+	if strings.HasPrefix(content, "`") || strings.HasSuffix(content, "`") {
+		return fence + " " + content + " " + fence
+	}
+
+	return fence + content + fence
+}
+
+func longestBacktickRun(content string) int {
+	longest := 0
+	current := 0
+	for _, r := range content {
+		if r == '`' {
+			current++
+			if current > longest {
+				longest = current
+			}
+			continue
+		}
+		current = 0
+	}
+
+	return longest
 }
 
 func rewriteRubyMarkup(fragment string) string {
@@ -1186,6 +1339,446 @@ func preferredRubyLeader(fragment string) string {
 	}
 
 	return "｜"
+}
+
+type markdownPlaceholder struct {
+	token string
+	value string
+}
+
+func extractMarkdownPlaceholders(fragment string) (string, []markdownPlaceholder) {
+	placeholders := make([]markdownPlaceholder, 0)
+	fragment = extractCodeBlockPlaceholders(fragment, &placeholders)
+	fragment = extractFigurePlaceholders(fragment, &placeholders)
+	fragment = extractListPlaceholders(fragment, &placeholders)
+	fragment = extractBlockquotePlaceholders(fragment, &placeholders)
+	return fragment, placeholders
+}
+
+func extractCodeBlockPlaceholders(fragment string, placeholders *[]markdownPlaceholder) string {
+	prePattern := regexp.MustCompile(`(?is)<pre\b[^>]*>(.*?)</pre>`)
+	codePattern := regexp.MustCompile(`(?is)^<code\b[^>]*>(.*?)</code>$`)
+
+	return prePattern.ReplaceAllStringFunc(fragment, func(block string) string {
+		matches := prePattern.FindStringSubmatch(block)
+		if len(matches) < 2 {
+			return block
+		}
+
+		content := strings.TrimSpace(matches[1])
+		if codeMatches := codePattern.FindStringSubmatch(content); len(codeMatches) >= 2 {
+			content = codeMatches[1]
+		}
+
+		content = html.UnescapeString(strings.ReplaceAll(content, "\r\n", "\n"))
+		content = strings.Trim(content, "\n")
+		fence := "```"
+		if strings.Contains(content, "```") {
+			fence = "````"
+		}
+		markdown := fence + "\n" + content + "\n" + fence
+		return addMarkdownPlaceholder(markdown, placeholders)
+	})
+}
+
+func extractListPlaceholders(fragment string, placeholders *[]markdownPlaceholder) string {
+	var builder strings.Builder
+	searchStart := 0
+	for {
+		start, tagName, found := findNextListBlock(fragment, searchStart)
+		if !found {
+			builder.WriteString(fragment[searchStart:])
+			return builder.String()
+		}
+
+		openEnd, closeStart, blockEnd, ok := findMatchingElementBounds(fragment, start, tagName)
+		if !ok {
+			builder.WriteString(fragment[searchStart:])
+			return builder.String()
+		}
+
+		builder.WriteString(fragment[searchStart:start])
+		block := fragment[start:blockEnd]
+		markdown := markdownForListBlock(block, 0)
+		if markdown == "" {
+			builder.WriteString(block)
+		} else {
+			builder.WriteString(addMarkdownPlaceholder(markdown, placeholders))
+		}
+
+		_ = openEnd
+		_ = closeStart
+		searchStart = blockEnd
+	}
+}
+
+func findNextListBlock(fragment string, start int) (int, string, bool) {
+	ulPattern := regexp.MustCompile(`(?is)<ul\b`)
+	olPattern := regexp.MustCompile(`(?is)<ol\b`)
+
+	ulMatch := ulPattern.FindStringIndex(fragment[start:])
+	olMatch := olPattern.FindStringIndex(fragment[start:])
+
+	switch {
+	case ulMatch == nil && olMatch == nil:
+		return 0, "", false
+	case ulMatch != nil && (olMatch == nil || ulMatch[0] <= olMatch[0]):
+		return start + ulMatch[0], "ul", true
+	default:
+		return start + olMatch[0], "ol", true
+	}
+}
+
+func markdownForListBlock(block string, level int) string {
+	tagName := "ul"
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(block)), "<ol") {
+		tagName = "ol"
+	}
+
+	openEnd, closeStart, _, ok := findMatchingElementBounds(block, 0, tagName)
+	if !ok {
+		return ""
+	}
+
+	inner := block[openEnd:closeStart]
+	items := extractTopLevelListItems(inner)
+	if len(items) == 0 {
+		return ""
+	}
+
+	lines := make([]string, 0, len(items))
+	for index, item := range items {
+		itemMarkdown := markdownForListItem(item, tagName == "ol", level, index+1)
+		if itemMarkdown == "" {
+			continue
+		}
+		lines = append(lines, itemMarkdown)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func extractTopLevelListItems(inner string) []string {
+	items := make([]string, 0)
+	searchStart := 0
+	itemPattern := regexp.MustCompile(`(?is)<li\b`)
+
+	for {
+		match := itemPattern.FindStringIndex(inner[searchStart:])
+		if match == nil {
+			return items
+		}
+
+		itemStart := searchStart + match[0]
+		openEnd, closeStart, itemEnd, ok := findMatchingElementBounds(inner, itemStart, "li")
+		if !ok {
+			return items
+		}
+
+		items = append(items, inner[openEnd:closeStart])
+		searchStart = itemEnd
+	}
+}
+
+func markdownForListItem(item string, ordered bool, level int, number int) string {
+	parts := make([]string, 0)
+	searchStart := 0
+
+	for {
+		listStart, _, found := findNextListBlock(item, searchStart)
+		if !found {
+			text := strings.TrimSpace(htmlToMarkdown(item[searchStart:]))
+			if text != "" {
+				parts = append(parts, text)
+			}
+			break
+		}
+
+		text := strings.TrimSpace(htmlToMarkdown(item[searchStart:listStart]))
+		if text != "" {
+			parts = append(parts, text)
+		}
+
+		_, _, blockEnd, ok := findMatchingElementBounds(item, listStart, strings.ToLower(item[listStart+1:listStart+3]))
+		if !ok {
+			break
+		}
+
+		nested := markdownForListBlock(item[listStart:blockEnd], level+1)
+		if nested != "" {
+			parts = append(parts, nested)
+		}
+		searchStart = blockEnd
+	}
+
+	if len(parts) == 0 {
+		return ""
+	}
+
+	indent := strings.Repeat("  ", level)
+	marker := "- "
+	if ordered {
+		marker = fmt.Sprintf("%d. ", number)
+	}
+
+	lines := make([]string, 0)
+	firstTextIndex := -1
+	for index, part := range parts {
+		if !strings.Contains(part, "\n- ") && !strings.Contains(part, "\n1. ") && !strings.HasPrefix(strings.TrimSpace(part), "- ") && !strings.HasPrefix(strings.TrimSpace(part), "1. ") {
+			firstTextIndex = index
+			break
+		}
+	}
+
+	if firstTextIndex == -1 {
+		lines = append(lines, indent+strings.TrimSpace(marker))
+		for _, part := range parts {
+			lines = append(lines, strings.Split(part, "\n")...)
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	textLines := strings.Split(parts[firstTextIndex], "\n")
+	lines = append(lines, indent+marker+textLines[0])
+	for _, line := range textLines[1:] {
+		if strings.TrimSpace(line) == "" {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, indent+"  "+line)
+	}
+
+	for index, part := range parts {
+		if index == firstTextIndex {
+			continue
+		}
+		lines = append(lines, strings.Split(part, "\n")...)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func findMatchingElementBounds(fragment string, start int, tagName string) (int, int, int, bool) {
+	tagPattern := regexp.MustCompile(`(?is)<(/?)([a-z0-9]+)\b[^>]*>`)
+	matches := tagPattern.FindAllStringSubmatchIndex(fragment[start:], -1)
+	depth := 0
+	openEnd := 0
+
+	for _, match := range matches {
+		tagStart := start + match[0]
+		tagEnd := start + match[1]
+		name := strings.ToLower(fragment[start+match[4] : start+match[5]])
+		if name != tagName {
+			continue
+		}
+
+		closing := match[2] >= 0 && fragment[start+match[2]:start+match[3]] == "/"
+		if !closing {
+			if depth == 0 {
+				openEnd = tagEnd
+			}
+			depth++
+			continue
+		}
+
+		depth--
+		if depth == 0 {
+			return openEnd, tagStart, tagEnd, true
+		}
+	}
+
+	return 0, 0, 0, false
+}
+
+func extractFigurePlaceholders(fragment string, placeholders *[]markdownPlaceholder) string {
+	figurePattern := regexp.MustCompile(`(?is)<figure\b[^>]*>(.*?)</figure>`)
+
+	return figurePattern.ReplaceAllStringFunc(fragment, func(block string) string {
+		if markdown := markdownForExternalArticleFigure(block); markdown != "" {
+			return addMarkdownPlaceholder(markdown, placeholders)
+		}
+		if markdown := markdownForFigure(block); markdown != "" {
+			return addMarkdownPlaceholder(markdown, placeholders)
+		}
+		return block
+	})
+}
+
+func extractBlockquotePlaceholders(fragment string, placeholders *[]markdownPlaceholder) string {
+	blockquotePattern := regexp.MustCompile(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
+
+	return blockquotePattern.ReplaceAllStringFunc(fragment, func(block string) string {
+		matches := blockquotePattern.FindStringSubmatch(block)
+		if len(matches) < 2 {
+			return block
+		}
+
+		inner := strings.TrimSpace(htmlToMarkdown(matches[1]))
+		if inner == "" {
+			return block
+		}
+
+		lines := strings.Split(inner, "\n")
+		for index, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				lines[index] = ">"
+				continue
+			}
+			lines[index] = "> " + line
+		}
+
+		return addMarkdownPlaceholder(strings.Join(lines, "\n"), placeholders)
+	})
+}
+
+func addMarkdownPlaceholder(markdown string, placeholders *[]markdownPlaceholder) string {
+	token := fmt.Sprintf("NOTE2MD_PLACEHOLDER_%d_", len(*placeholders))
+	*placeholders = append(*placeholders, markdownPlaceholder{
+		token: token,
+		value: markdown,
+	})
+	return "\n\n" + token + "\n\n"
+}
+
+func restoreMarkdownPlaceholders(content string, placeholders []markdownPlaceholder) string {
+	for _, placeholder := range placeholders {
+		content = strings.ReplaceAll(content, placeholder.token, placeholder.value)
+	}
+	return content
+}
+
+func markdownForExternalArticleFigure(block string) string {
+	if !strings.Contains(strings.ToLower(block), `embedded-service="external-article"`) {
+		return ""
+	}
+
+	targetURL := firstNonEmpty(
+		extractTagAttribute(block, "data-src"),
+		extractFirstHref(block),
+	)
+	title := cleanInlineHTML(extractByPattern(block, `(?is)<strong\b[^>]*class=["'][^"']*external-article-widget-title[^"']*["'][^>]*>(.*?)</strong>`))
+	description := cleanInlineHTML(extractByPattern(block, `(?is)<em\b[^>]*class=["'][^"']*external-article-widget-description[^"']*["'][^>]*>(.*?)</em>`))
+	domain := cleanInlineHTML(extractByPattern(block, `(?is)<em\b[^>]*class=["'][^"']*external-article-widget-url[^"']*["'][^>]*>(.*?)</em>`))
+
+	if title == "" && description == "" && domain == "" {
+		return ""
+	}
+
+	lines := make([]string, 0, 5)
+	switch {
+	case title != "" && targetURL != "":
+		lines = append(lines, "["+title+"]("+targetURL+")")
+	case title != "":
+		lines = append(lines, title)
+	case targetURL != "":
+		lines = append(lines, targetURL)
+	}
+
+	if description != "" {
+		lines = append(lines, "", description)
+	}
+	if domain != "" {
+		lines = append(lines, "", domain)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func markdownForFigure(block string) string {
+	lines := make([]string, 0, 4)
+
+	if quoteMarkdown := markdownForFigureBlockquote(block); quoteMarkdown != "" {
+		lines = append(lines, quoteMarkdown)
+	}
+
+	captionText, captionURL := extractFigureCaption(block)
+	switch {
+	case captionText != "" && captionURL != "":
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "["+captionText+"]("+captionURL+")")
+	case captionText != "":
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, captionText)
+	case captionURL != "":
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, captionURL)
+	}
+
+	if len(lines) > 0 {
+		return strings.Join(lines, "\n")
+	}
+
+	if strings.Contains(strings.ToLower(block), `embedded-service="note"`) {
+		targetURL := firstNonEmpty(
+			extractTagAttribute(block, "data-src"),
+			extractFirstHref(block),
+		)
+		if targetURL != "" {
+			return targetURL
+		}
+	}
+
+	return ""
+}
+
+func markdownForFigureBlockquote(block string) string {
+	pattern := regexp.MustCompile(`(?is)<blockquote\b[^>]*>(.*?)</blockquote>`)
+	matches := pattern.FindStringSubmatch(block)
+	if len(matches) < 2 {
+		return ""
+	}
+	inner := strings.TrimSpace(htmlToMarkdown(matches[1]))
+	if inner == "" {
+		return ""
+	}
+
+	lines := strings.Split(inner, "\n")
+	for index, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			lines[index] = ">"
+			continue
+		}
+		lines[index] = "> " + line
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func extractFigureCaption(block string) (string, string) {
+	pattern := regexp.MustCompile(`(?is)<figcaption\b[^>]*>(.*?)</figcaption>`)
+	matches := pattern.FindStringSubmatch(block)
+	if len(matches) < 2 {
+		return "", ""
+	}
+
+	caption := matches[1]
+	url := extractFirstHref(caption)
+	text := cleanInlineHTML(caption)
+	return text, url
+}
+
+func extractFirstHref(block string) string {
+	pattern := regexp.MustCompile(`(?is)<a\b[^>]*href=["'](.*?)["']`)
+	matches := pattern.FindStringSubmatch(block)
+	if len(matches) < 2 {
+		return ""
+	}
+	return html.UnescapeString(strings.TrimSpace(matches[1]))
+}
+
+func extractByPattern(block string, pattern string) string {
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(block)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
 }
 
 func normalizeMarkdownContent(markdownBody string) string {
@@ -1286,10 +1879,60 @@ func normalizeNoteMarkdown(markdownBody string) string {
 	lines = normalizeBrokenHeadings(lines)
 	lines = rewriteLeadingAuthorBlock(lines)
 	lines = removeUnwantedLines(lines)
+	lines = mergeAdjacentListBlocks(lines)
 
 	result := strings.Join(lines, "\n")
 	result = regexp.MustCompile(`\n{3,}`).ReplaceAllString(result, "\n\n")
 	return strings.TrimSpace(result)
+}
+
+func mergeAdjacentListBlocks(lines []string) []string {
+	merged := make([]string, 0, len(lines))
+	for index := 0; index < len(lines); index++ {
+		if strings.TrimSpace(lines[index]) != "" {
+			merged = append(merged, lines[index])
+			continue
+		}
+
+		prev := previousNonEmptyLine(merged)
+		next := nextNonEmptyLine(lines, index+1)
+		if isMarkdownListLine(prev) && isMarkdownListLine(next) {
+			continue
+		}
+
+		merged = append(merged, lines[index])
+	}
+
+	return merged
+}
+
+func previousNonEmptyLine(lines []string) string {
+	for index := len(lines) - 1; index >= 0; index-- {
+		if strings.TrimSpace(lines[index]) != "" {
+			return lines[index]
+		}
+	}
+	return ""
+}
+
+func nextNonEmptyLine(lines []string, start int) string {
+	for index := start; index < len(lines); index++ {
+		if strings.TrimSpace(lines[index]) != "" {
+			return lines[index]
+		}
+	}
+	return ""
+}
+
+func isMarkdownListLine(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t")
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") {
+		return true
+	}
+	return regexp.MustCompile(`^\d+\. `).MatchString(trimmed)
 }
 
 func normalizeBrokenHeadings(lines []string) []string {
@@ -1317,7 +1960,14 @@ func normalizeBrokenHeadings(lines []string) []string {
 func rewriteLeadingAuthorBlock(lines []string) []string {
 	trimmed := dropLeadingBlankLines(lines)
 	if len(trimmed) < 4 {
+		if rewritten, ok := rewriteInlineAuthorMetadata(trimmed); ok {
+			return rewritten
+		}
 		return trimmed
+	}
+
+	if rewritten, ok := rewriteInlineAuthorMetadata(trimmed); ok {
+		return rewritten
 	}
 
 	start := findLeadingAuthorBlockStart(trimmed)
@@ -1354,6 +2004,75 @@ func rewriteLeadingAuthorBlock(lines []string) []string {
 	}
 
 	return rewritten
+}
+
+func rewriteInlineAuthorMetadata(lines []string) ([]string, bool) {
+	limit := minInt(len(lines), 8)
+	for index := 0; index < limit; index++ {
+		author, dateText, remainder, ok := extractInlineAuthorMetadata(lines[index])
+		if !ok {
+			continue
+		}
+
+		rewritten := append([]string{}, lines[:index]...)
+		for len(rewritten) > 0 {
+			trimmed := strings.TrimSpace(rewritten[len(rewritten)-1])
+			if trimmed == "" || trimmed == "**" || trimmed == "*" || regexp.MustCompile(`^\d+$`).MatchString(trimmed) {
+				rewritten = rewritten[:len(rewritten)-1]
+				continue
+			}
+			break
+		}
+		if len(rewritten) > 0 && strings.TrimSpace(rewritten[len(rewritten)-1]) != "" {
+			rewritten = append(rewritten, "")
+		}
+
+		rewritten = append(rewritten, author, dateText, "", "---")
+		if remainder != "" {
+			rewritten = append(rewritten, "", remainder)
+		}
+		rewritten = append(rewritten, lines[index+1:]...)
+		return rewritten, true
+	}
+
+	return nil, false
+}
+
+func extractInlineAuthorMetadata(line string) (string, string, string, bool) {
+	datePattern := regexp.MustCompile(`\d{4}年\d{1,2}月\d{1,2}日 \d{1,2}:\d{2}`)
+	dateRange := datePattern.FindStringIndex(line)
+	if dateRange == nil {
+		return "", "", "", false
+	}
+
+	beforeDate := strings.TrimSpace(line[:dateRange[0]])
+	afterDate := strings.TrimSpace(line[dateRange[1]:])
+	author := extractLastMarkdownLinkLabel(beforeDate)
+	if author == "" {
+		author = strings.TrimSpace(regexp.MustCompile(`\[[^\]]*\]\([^)]+\)`).ReplaceAllString(beforeDate, ""))
+		author = strings.TrimSpace(regexp.MustCompile(`\([^)]+\)`).ReplaceAllString(author, ""))
+	}
+	if author == "" {
+		return "", "", "", false
+	}
+
+	return author, line[dateRange[0]:dateRange[1]], afterDate, true
+}
+
+func extractLastMarkdownLinkLabel(line string) string {
+	pattern := regexp.MustCompile(`\[(.*?)\]\([^)]+\)`)
+	matches := pattern.FindAllStringSubmatch(line, -1)
+	for index := len(matches) - 1; index >= 0; index-- {
+		if len(matches[index]) < 2 {
+			continue
+		}
+		label := strings.TrimSpace(matches[index][1])
+		if label != "" {
+			return label
+		}
+	}
+
+	return ""
 }
 
 func trimLeadingProfileLink(line string, profileLine string) (string, bool) {
@@ -1404,6 +2123,12 @@ func removeUnwantedLines(lines []string) []string {
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "ダウンロード" || strings.EqualFold(trimmed, "copy") {
+			continue
+		}
+		if trimmed == "*" || trimmed == "**" {
+			continue
+		}
+		if regexp.MustCompile(`^\[\]\([^)]+\)$`).MatchString(trimmed) {
 			continue
 		}
 		if regexp.MustCompile(`^\d+$`).MatchString(trimmed) && followsHeading(filtered) {
